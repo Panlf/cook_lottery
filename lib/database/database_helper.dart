@@ -1,15 +1,31 @@
-import 'package:sqflite/sqflite.dart';
+import 'package:flutter/foundation.dart';
 import 'package:path/path.dart';
-import '../models/dish.dart';
+import 'package:sqflite/sqflite.dart';
+
 import '../models/category.dart';
+import '../models/dish.dart';
 import '../models/meal_record.dart';
 import '../models/practice_record.dart';
 
+/// SQLite 本地数据库管理（单例）。
 class DatabaseHelper {
   static final DatabaseHelper instance = DatabaseHelper._init();
   static Database? _database;
+  static String? _debugPathOverride;
 
   DatabaseHelper._init();
+
+  /// 仅供测试：覆盖数据库文件路径，避免依赖平台目录。
+  @visibleForTesting
+  static void debugSetDatabasePath(String path) => _debugPathOverride = path;
+
+  /// 仅供测试：关闭并丢弃当前连接，下次访问时按当前路径重新打开。
+  @visibleForTesting
+  static Future<void> debugReset() async {
+    final db = _database;
+    _database = null;
+    await db?.close();
+  }
 
   Future<Database> get database async {
     if (_database != null) return _database!;
@@ -18,9 +34,8 @@ class DatabaseHelper {
   }
 
   Future<Database> _initDB(String filePath) async {
-    final dbPath = await getDatabasesPath();
-    final path = join(dbPath, filePath);
-    return await openDatabase(path, version: 1, onCreate: _createDB);
+    final path = _debugPathOverride ?? join(await getDatabasesPath(), filePath);
+    return openDatabase(path, version: 1, onCreate: _createDB);
   }
 
   Future _createDB(Database db, int version) async {
@@ -86,27 +101,31 @@ class DatabaseHelper {
   }
 
   // Category CRUD
+
   Future<List<DishCategory>> getAllCategories() async {
     final db = await database;
     final result = await db.query('categories', orderBy: 'sort_order ASC');
-    return result.map((map) => DishCategory.fromMap(map)).toList();
+    return result.map(DishCategory.fromMap).toList();
   }
 
   Future<DishCategory?> getCategory(int id) async {
     final db = await database;
-    final result = await db.query('categories', where: 'id = ?', whereArgs: [id]);
-    if (result.isEmpty) return null;
-    return DishCategory.fromMap(result.first);
+    final result = await db.query(
+      'categories',
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+    return result.isEmpty ? null : DishCategory.fromMap(result.first);
   }
 
   Future<int> insertCategory(DishCategory category) async {
     final db = await database;
-    return await db.insert('categories', category.toMap()..remove('id'));
+    return db.insert('categories', category.toMap()..remove('id'));
   }
 
   Future<int> updateCategory(DishCategory category) async {
     final db = await database;
-    return await db.update(
+    return db.update(
       'categories',
       category.toMap(),
       where: 'id = ?',
@@ -114,45 +133,77 @@ class DatabaseHelper {
     );
   }
 
-  Future<int> deleteCategory(int id) async {
+  /// 删除分类及其下所有菜品（事务保证原子性）。
+  /// 返回被删菜品的图片路径列表，由调用方负责清理文件。
+  Future<List<String?>> deleteCategory(int id) async {
     final db = await database;
-    await db.delete('dishes', where: 'category_id = ?', whereArgs: [id]);
-    return await db.delete('categories', where: 'id = ?', whereArgs: [id]);
+    final dishes = await db.query(
+      'dishes',
+      columns: ['image_path'],
+      where: 'category_id = ?',
+      whereArgs: [id],
+    );
+    await db.transaction((txn) async {
+      await txn.delete('dishes', where: 'category_id = ?', whereArgs: [id]);
+      await txn.delete('categories', where: 'id = ?', whereArgs: [id]);
+    });
+    return dishes.map((row) => row['image_path'] as String?).toList();
+  }
+
+  /// 下一个可用的分类排序号（当前最大值 + 1，避免删除分类后产生重复排序号）。
+  Future<int> getNextCategorySortOrder() async {
+    final db = await database;
+    final result = await db.rawQuery(
+      'SELECT MAX(sort_order) AS max_order FROM categories',
+    );
+    return ((result.first['max_order'] as int?) ?? -1) + 1;
   }
 
   // Dish CRUD
+
   Future<List<Dish>> getAllDishes() async {
     final db = await database;
     final result = await db.query('dishes', orderBy: 'created_at DESC');
-    return result.map((map) => Dish.fromMap(map)).toList();
-  }
-
-  Future<List<Dish>> getDishesByCategory(int categoryId) async {
-    final db = await database;
-    final result = await db.query(
-      'dishes',
-      where: 'category_id = ?',
-      whereArgs: [categoryId],
-      orderBy: 'created_at DESC',
-    );
-    return result.map((map) => Dish.fromMap(map)).toList();
+    return result.map(Dish.fromMap).toList();
   }
 
   Future<Dish?> getDish(int id) async {
     final db = await database;
     final result = await db.query('dishes', where: 'id = ?', whereArgs: [id]);
-    if (result.isEmpty) return null;
-    return Dish.fromMap(result.first);
+    return result.isEmpty ? null : Dish.fromMap(result.first);
+  }
+
+  Future<Dish?> getDishByName(String name) async {
+    final db = await database;
+    final result = await db.query(
+      'dishes',
+      where: 'name = ?',
+      whereArgs: [name],
+      limit: 1,
+    );
+    return result.isEmpty ? null : Dish.fromMap(result.first);
+  }
+
+  Future<List<Dish>> getDishesByIds(List<int> ids) async {
+    if (ids.isEmpty) return [];
+    final db = await database;
+    final placeholders = List.filled(ids.length, '?').join(',');
+    final result = await db.query(
+      'dishes',
+      where: 'id IN ($placeholders)',
+      whereArgs: ids,
+    );
+    return result.map(Dish.fromMap).toList();
   }
 
   Future<int> insertDish(Dish dish) async {
     final db = await database;
-    return await db.insert('dishes', dish.toMap()..remove('id'));
+    return db.insert('dishes', dish.toMap()..remove('id'));
   }
 
   Future<int> updateDish(Dish dish) async {
     final db = await database;
-    return await db.update(
+    return db.update(
       'dishes',
       dish.toMap(),
       where: 'id = ?',
@@ -162,46 +213,71 @@ class DatabaseHelper {
 
   Future<int> deleteDish(int id) async {
     final db = await database;
-    return await db.delete('dishes', where: 'id = ?', whereArgs: [id]);
+    return db.delete('dishes', where: 'id = ?', whereArgs: [id]);
   }
 
-  Future<int> getDishCountByCategory(int categoryId) async {
+  // Meal Record CRUD
+
+  Future<List<MealRecord>> getAllMealRecords() async {
+    final db = await database;
+    // 同一天内按 午餐 →晚餐 的实际时间顺序展示
+    final result = await db.query(
+      'meal_records',
+      orderBy: "date DESC, CASE WHEN meal_type = 'lunch' THEN 0 ELSE 1 END",
+    );
+    return result.map(MealRecord.fromMap).toList();
+  }
+
+  /// 查询包含指定菜品的饮食记录（菜品详情页的最近搭配列表）。
+  Future<List<MealRecord>> getMealRecordsContainingDish(
+    int dishId, {
+    int limit = 10,
+  }) async {
+    final db = await database;
+    // dish_ids 为逗号分隔文本，两侧补逗号后按「,id,」整段匹配，避免 5 误匹配 15。
+    final result = await db.query(
+      'meal_records',
+      where: "',' || dish_ids || ',' LIKE ?",
+      whereArgs: ['%,$dishId,%'],
+      orderBy: 'date DESC',
+      limit: limit,
+    );
+    return result.map(MealRecord.fromMap).toList();
+  }
+
+  /// 包含指定菜品的饮食记录总数（不受最近条数限制，用于「上桌次数」展示）。
+  Future<int> countMealRecordsContainingDish(int dishId) async {
     final db = await database;
     final result = await db.rawQuery(
-      'SELECT COUNT(*) as count FROM dishes WHERE category_id = ?',
-      [categoryId],
+      "SELECT COUNT(*) AS count FROM meal_records WHERE ',' || dish_ids || ',' LIKE ?",
+      ['%,$dishId,%'],
     );
     return Sqflite.firstIntValue(result) ?? 0;
   }
 
-  // Meal Record CRUD
-  Future<List<MealRecord>> getAllMealRecords() async {
+  /// [since] 之后吃过的菜品 ID 集合（用于抽签时避开近期吃过的菜）。
+  Future<Set<int>> getEatenDishIdsSince(DateTime since) async {
     final db = await database;
-    final result = await db.query('meal_records', orderBy: 'date DESC, meal_type ASC');
-    return result.map((map) => MealRecord.fromMap(map)).toList();
-  }
-
-  Future<List<MealRecord>> getMealRecordsByDate(DateTime date) async {
-    final db = await database;
-    final startOfDay = DateTime(date.year, date.month, date.day);
-    final endOfDay = startOfDay.add(const Duration(days: 1));
     final result = await db.query(
       'meal_records',
-      where: 'date >= ? AND date < ?',
-      whereArgs: [startOfDay.millisecondsSinceEpoch, endOfDay.millisecondsSinceEpoch],
-      orderBy: 'meal_type ASC',
+      columns: ['dish_ids'],
+      where: 'date >= ?',
+      whereArgs: [since.millisecondsSinceEpoch],
     );
-    return result.map((map) => MealRecord.fromMap(map)).toList();
+    return {
+      for (final row in result)
+        ...MealRecord.parseDishIds(row['dish_ids'] as String? ?? ''),
+    };
   }
 
   Future<int> insertMealRecord(MealRecord record) async {
     final db = await database;
-    return await db.insert('meal_records', record.toMap()..remove('id'));
+    return db.insert('meal_records', record.toMap()..remove('id'));
   }
 
   Future<int> updateMealRecord(MealRecord record) async {
     final db = await database;
-    return await db.update(
+    return db.update(
       'meal_records',
       record.toMap(),
       where: 'id = ?',
@@ -211,43 +287,28 @@ class DatabaseHelper {
 
   Future<int> deleteMealRecord(int id) async {
     final db = await database;
-    return await db.delete('meal_records', where: 'id = ?', whereArgs: [id]);
+    return db.delete('meal_records', where: 'id = ?', whereArgs: [id]);
   }
 
   // Practice Record CRUD
-  Future<List<PracticeRecord>> getAllPracticeRecords() async {
-    final db = await database;
-    final result = await db.query('practice_records', orderBy: 'created_at DESC');
-    return result.map((map) => PracticeRecord.fromMap(map)).toList();
-  }
 
-  Future<List<PracticeRecord>> getPracticeRecordsByDish(String dishName) async {
+  Future<List<PracticeRecord>> getAllPracticeRecords() async {
     final db = await database;
     final result = await db.query(
       'practice_records',
-      where: 'dish_name = ?',
-      whereArgs: [dishName],
       orderBy: 'created_at DESC',
     );
-    return result.map((map) => PracticeRecord.fromMap(map)).toList();
-  }
-
-  Future<List<String>> getAllPracticeDishNames() async {
-    final db = await database;
-    final result = await db.rawQuery(
-      'SELECT DISTINCT dish_name FROM practice_records WHERE is_promoted = 0 ORDER BY dish_name ASC'
-    );
-    return result.map((map) => map['dish_name'] as String).toList();
+    return result.map(PracticeRecord.fromMap).toList();
   }
 
   Future<int> insertPracticeRecord(PracticeRecord record) async {
     final db = await database;
-    return await db.insert('practice_records', record.toMap()..remove('id'));
+    return db.insert('practice_records', record.toMap()..remove('id'));
   }
 
   Future<int> updatePracticeRecord(PracticeRecord record) async {
     final db = await database;
-    return await db.update(
+    return db.update(
       'practice_records',
       record.toMap(),
       where: 'id = ?',
@@ -257,27 +318,6 @@ class DatabaseHelper {
 
   Future<int> deletePracticeRecord(int id) async {
     final db = await database;
-    return await db.delete('practice_records', where: 'id = ?', whereArgs: [id]);
-  }
-
-  // Stats
-  Future<int> getTotalDishes() async {
-    final db = await database;
-    final result = await db.rawQuery('SELECT COUNT(*) as count FROM dishes');
-    return Sqflite.firstIntValue(result) ?? 0;
-  }
-
-  Future<int> getTotalMeals() async {
-    final db = await database;
-    final result = await db.rawQuery('SELECT COUNT(*) as count FROM meal_records');
-    return Sqflite.firstIntValue(result) ?? 0;
-  }
-
-  Future<double> getAverageRating() async {
-    final db = await database;
-    final result = await db.rawQuery(
-      'SELECT AVG(rating) as avg_rating FROM meal_records WHERE rating IS NOT NULL'
-    );
-    return (result.first['avg_rating'] as double?) ?? 0.0;
+    return db.delete('practice_records', where: 'id = ?', whereArgs: [id]);
   }
 }

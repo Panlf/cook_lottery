@@ -12,12 +12,7 @@ class DishCategory {
   });
 
   Map<String, dynamic> toMap() {
-    return {
-      'id': id,
-      'name': name,
-      'emoji': emoji,
-      'sort_order': sortOrder,
-    };
+    return {'id': id, 'name': name, 'emoji': emoji, 'sort_order': sortOrder};
   }
 
   factory DishCategory.fromMap(Map<String, dynamic> map) {

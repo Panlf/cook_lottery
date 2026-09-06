@@ -1,17 +1,19 @@
 import 'dart:io';
+
 import 'package:flutter/material.dart';
-import 'package:image_picker/image_picker.dart';
+
 import '../database/database_helper.dart';
-import '../models/dish.dart';
 import '../models/category.dart';
+import '../models/dish.dart';
+import '../services/image_service.dart';
 import '../theme/app_theme.dart';
+import '../utils/feedback.dart';
+import '../widgets/image_source_sheet.dart';
 
 class AddDishScreen extends StatefulWidget {
   final Dish? dish;
-  final String? initialName;
-  final int? initialCategoryId;
 
-  const AddDishScreen({super.key, this.dish, this.initialName, this.initialCategoryId});
+  const AddDishScreen({super.key, this.dish});
 
   @override
   State<AddDishScreen> createState() => _AddDishScreenState();
@@ -23,69 +25,143 @@ class _AddDishScreenState extends State<AddDishScreen> {
   String? _imagePath;
   List<DishCategory> _categories = [];
   bool _isLoading = true;
+  bool _isSaving = false;
+
+  /// 本次是否选过新图片；用于在未保存就退出时回收图片文件。
+  bool _imageChanged = false;
 
   bool get _isEditing => widget.dish != null;
 
   @override
   void initState() {
     super.initState();
-    _loadData();
-    if (widget.dish != null) {
-      _nameController.text = widget.dish!.name;
-      _selectedCategoryId = widget.dish!.categoryId;
-      _imagePath = widget.dish!.imagePath;
-    } else {
-      if (widget.initialName != null) _nameController.text = widget.initialName!;
-      if (widget.initialCategoryId != null) _selectedCategoryId = widget.initialCategoryId;
+    final dish = widget.dish;
+    if (dish != null) {
+      _nameController.text = dish.name;
+      _selectedCategoryId = dish.categoryId;
+      _imagePath = dish.imagePath;
     }
+    _loadData();
+  }
+
+  @override
+  void dispose() {
+    if (_imageChanged && _imagePath != widget.dish?.imagePath) {
+      ImageService.delete(_imagePath);
+    }
+    _nameController.dispose();
+    super.dispose();
   }
 
   Future<void> _loadData() async {
-    final categories = await DatabaseHelper.instance.getAllCategories();
-    setState(() {
-      _categories = categories;
-      if (_selectedCategoryId == null && categories.isNotEmpty) {
-        _selectedCategoryId = categories.first.id;
-      }
-      _isLoading = false;
-    });
-  }
-
-  Future<void> _pickImage(ImageSource source) async {
-    final picker = ImagePicker();
-    final picked = await picker.pickImage(source: source, maxWidth: 1024, imageQuality: 85);
-    if (picked != null) {
-      setState(() => _imagePath = picked.path);
+    try {
+      final categories = await DatabaseHelper.instance.getAllCategories();
+      if (!mounted) return;
+      setState(() {
+        _categories = categories;
+        _selectedCategoryId ??= categories.firstOrNull?.id;
+        _isLoading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _isLoading = false);
+      if (mounted) showErrorSnackBar(context, '分类加载失败');
     }
   }
 
-  void _showImagePicker() {
-    showModalBottomSheet(
+  Future<void> _pickImage() async {
+    final newPath = await pickAndPersistImage(context);
+    if (newPath == null || !mounted) return;
+    // 本次会话里反复换图时，及时清理上一张未保存的图片。
+    if (_imageChanged) await ImageService.delete(_imagePath);
+    setState(() {
+      _imagePath = newPath;
+      _imageChanged = true;
+    });
+  }
+
+  Future<void> _saveDish() async {
+    if (_isSaving) return;
+    final name = _nameController.text.trim();
+    if (name.isEmpty) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('请输入菜品名称')));
+      return;
+    }
+    final categoryId = _selectedCategoryId;
+    if (categoryId == null) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('请选择分类')));
+      return;
+    }
+
+    setState(() => _isSaving = true);
+    final original = widget.dish;
+    try {
+      if (original != null) {
+        await DatabaseHelper.instance.updateDish(
+          original.copyWith(
+            name: name,
+            categoryId: categoryId,
+            imagePath: _imagePath,
+          ),
+        );
+        if (_imageChanged) await ImageService.delete(original.imagePath);
+      } else {
+        await DatabaseHelper.instance.insertDish(
+          Dish(name: name, categoryId: categoryId, imagePath: _imagePath),
+        );
+      }
+      _imageChanged = false;
+    } catch (_) {
+      if (mounted) showErrorSnackBar(context, '保存失败，请重试');
+      return;
+    } finally {
+      if (mounted) setState(() => _isSaving = false);
+    }
+
+    if (mounted) Navigator.pop(context);
+  }
+
+  void _confirmDelete() {
+    final dish = widget.dish!;
+    showDialog(
       context: context,
-      builder: (context) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              leading: const Icon(Icons.camera_alt, color: AppTheme.primaryColor),
-              title: const Text('拍照'),
-              onTap: () {
-                Navigator.pop(context);
-                _pickImage(ImageSource.camera);
-              },
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('删除菜品'),
+        content: Text('确定要删除「${dish.name}」吗？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('取消'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppTheme.deleteColor,
             ),
-            ListTile(
-              leading: const Icon(Icons.photo_library, color: AppTheme.primaryColor),
-              title: const Text('从相册选择'),
-              onTap: () {
-                Navigator.pop(context);
-                _pickImage(ImageSource.gallery);
-              },
-            ),
-          ],
-        ),
+            onPressed: () async {
+              Navigator.pop(dialogContext);
+              await _deleteDish(dish);
+            },
+            child: const Text('删除', style: TextStyle(color: Colors.white)),
+          ),
+        ],
       ),
     );
+  }
+
+  Future<void> _deleteDish(Dish dish) async {
+    try {
+      await DatabaseHelper.instance.deleteDish(dish.id!);
+      await ImageService.delete(dish.imagePath);
+      _imageChanged = false;
+    } catch (_) {
+      if (mounted) showErrorSnackBar(context, '删除失败，请重试');
+      return;
+    }
+    if (mounted) Navigator.pop(context);
   }
 
   @override
@@ -96,13 +172,19 @@ class _AddDishScreenState extends State<AddDishScreen> {
         actions: [
           if (_isEditing)
             IconButton(
-              icon: const Icon(Icons.delete_outline, color: AppTheme.deleteColor),
-              onPressed: _deleteDish,
+              icon: const Icon(
+                Icons.delete_outline,
+                color: AppTheme.deleteColor,
+              ),
+              tooltip: '删除菜品',
+              onPressed: _confirmDelete,
             ),
         ],
       ),
       body: _isLoading
-          ? const Center(child: CircularProgressIndicator(color: AppTheme.primaryColor))
+          ? const Center(
+              child: CircularProgressIndicator(color: AppTheme.primaryColor),
+            )
           : SingleChildScrollView(
               padding: const EdgeInsets.all(20),
               child: Column(
@@ -119,30 +201,51 @@ class _AddDishScreenState extends State<AddDishScreen> {
                     textCapitalization: TextCapitalization.sentences,
                   ),
                   const SizedBox(height: 20),
-                  const Text('选择分类', style: TextStyle(color: AppTheme.textSecondary, fontSize: 14)),
-                  const SizedBox(height: 10),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    children: _categories.map((cat) {
-                      final isSelected = cat.id == _selectedCategoryId;
-                      return ChoiceChip(
-                        avatar: Text(cat.emoji),
-                        label: Text(cat.name),
-                        selected: isSelected,
-                        onSelected: (_) => setState(() => _selectedCategoryId = cat.id),
-                        selectedColor: AppTheme.primaryColor,
-                        labelStyle: TextStyle(
-                          color: isSelected ? Colors.white : AppTheme.textPrimary,
-                        ),
-                        checkmarkColor: Colors.white,
-                      );
-                    }).toList(),
+                  const Text(
+                    '选择分类',
+                    style: TextStyle(
+                      color: AppTheme.textSecondary,
+                      fontSize: 14,
+                    ),
                   ),
+                  const SizedBox(height: 10),
+                  if (_categories.isEmpty)
+                    const Text(
+                      '还没有分类，请先到「菜谱库」页添加分类',
+                      style: TextStyle(color: AppTheme.textHint, fontSize: 13),
+                    )
+                  else
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: _categories.map((cat) {
+                        final isSelected = cat.id == _selectedCategoryId;
+                        return ChoiceChip(
+                          avatar: Text(cat.emoji),
+                          label: Text(cat.name),
+                          selected: isSelected,
+                          onSelected: (_) =>
+                              setState(() => _selectedCategoryId = cat.id),
+                          selectedColor: AppTheme.primaryColor,
+                          labelStyle: TextStyle(
+                            color: isSelected
+                                ? Colors.white
+                                : AppTheme.textPrimary,
+                          ),
+                          checkmarkColor: Colors.white,
+                        );
+                      }).toList(),
+                    ),
                   const SizedBox(height: 40),
                   ElevatedButton(
-                    onPressed: _saveDish,
-                    child: Text(_isEditing ? '保存修改' : '添加菜品'),
+                    onPressed: _isSaving || _categories.isEmpty
+                        ? null
+                        : _saveDish,
+                    child: Text(
+                      _isSaving
+                          ? '保存中...'
+                          : (widget.dish != null ? '保存修改' : '添加菜品'),
+                    ),
                   ),
                 ],
               ),
@@ -151,108 +254,45 @@ class _AddDishScreenState extends State<AddDishScreen> {
   }
 
   Widget _buildImagePicker() {
+    final file = _imagePath == null ? null : File(_imagePath!);
+    final hasImage = file != null && file.existsSync();
     return GestureDetector(
-      onTap: _showImagePicker,
+      onTap: _pickImage,
       child: Container(
         height: 220,
         decoration: BoxDecoration(
           color: AppTheme.accentColor,
           borderRadius: BorderRadius.circular(20),
-          image: _imagePath != null && File(_imagePath!).existsSync()
-              ? DecorationImage(
-                  image: FileImage(File(_imagePath!)),
-                  fit: BoxFit.cover,
-                )
+          image: hasImage
+              ? DecorationImage(image: FileImage(file), fit: BoxFit.cover)
               : null,
         ),
-        child: _imagePath == null || !File(_imagePath!).existsSync()
-            ? const Column(
+        child: hasImage
+            ? Align(
+                alignment: Alignment.topRight,
+                child: Container(
+                  margin: const EdgeInsets.all(12),
+                  padding: const EdgeInsets.all(6),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.5),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: const Icon(
+                    Icons.camera_alt,
+                    color: Colors.white,
+                    size: 20,
+                  ),
+                ),
+              )
+            : const Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   Icon(Icons.add_a_photo, size: 48, color: AppTheme.textHint),
                   SizedBox(height: 8),
                   Text('添加菜品照片', style: TextStyle(color: AppTheme.textHint)),
                 ],
-              )
-            : Align(
-                alignment: Alignment.topRight,
-                child: Container(
-                  margin: const EdgeInsets.all(12),
-                  padding: const EdgeInsets.all(6),
-                  decoration: BoxDecoration(
-                    color: Colors.black.withOpacity(0.5),
-                    borderRadius: BorderRadius.circular(20),
-                  ),
-                  child: const Icon(Icons.camera_alt, color: Colors.white, size: 20),
-                ),
               ),
       ),
     );
-  }
-
-  Future<void> _saveDish() async {
-    if (_nameController.text.trim().isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('请输入菜品名称')),
-      );
-      return;
-    }
-    if (_selectedCategoryId == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('请选择分类')),
-      );
-      return;
-    }
-
-    if (_isEditing) {
-      final updated = widget.dish!.copyWith(
-        name: _nameController.text.trim(),
-        categoryId: _selectedCategoryId!,
-        imagePath: _imagePath,
-      );
-      await DatabaseHelper.instance.updateDish(updated);
-    } else {
-      final dish = Dish(
-        name: _nameController.text.trim(),
-        categoryId: _selectedCategoryId!,
-        imagePath: _imagePath,
-      );
-      await DatabaseHelper.instance.insertDish(dish);
-    }
-
-    if (mounted) Navigator.pop(context);
-  }
-
-  void _deleteDish() {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('删除菜品'),
-        content: Text('确定要删除「${widget.dish!.name}」吗？'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('取消'),
-          ),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: AppTheme.deleteColor),
-            onPressed: () async {
-              await DatabaseHelper.instance.deleteDish(widget.dish!.id!);
-              if (mounted) {
-                Navigator.pop(context);
-                Navigator.pop(context);
-              }
-            },
-            child: const Text('删除', style: TextStyle(color: Colors.white)),
-          ),
-        ],
-      ),
-    );
-  }
-
-  @override
-  void dispose() {
-    _nameController.dispose();
-    super.dispose();
   }
 }
